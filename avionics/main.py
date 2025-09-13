@@ -3,23 +3,46 @@ from datetime import datetime
 import time
 import os
 import csv
+import RPi.GPIO as GPIO
 from instruments import gps, barometer, accelerometer
+import sys
 
+# --- Constants ---
 DATA_PATH = 'data'
-GPS_DATA_RATE = 1 # Hz
+
+GPS_DATA_RATE = 1  # Hz
 GPS_DATA_PERIOD = 1 / GPS_DATA_RATE  # seconds
 
-BAROMETER_DATA_RATE = 2000 # Hz
+# This setting of 2000 is resulting in 11 Hz sample rate in recorded data
+BAROMETER_DATA_RATE = 2000  # Hz
 BAROMETER_DATA_PERIOD = 1 / BAROMETER_DATA_RATE  # seconds
 
-# This setting of 145 is resulting in 107.62 Hz sample rate in recorded data
+# This setting of 2000 is resulting in 250 Hz sample rate in recorded data
 ACCEL_DATA_RATE = 2000 # Hz
 ACCEL_DATA_PERIOD = 1 / ACCEL_DATA_RATE  # seconds
 
-# Begin by creating session folder in /data
+BUZZER_PIN = 4
+
+# --- Setup session folder in /data ---
 current_datetime = datetime.now().strftime('%Y%m%dT%H%M%S')
 SESSION_DATA_PATH = f"{DATA_PATH}/{current_datetime}"
 os.makedirs(SESSION_DATA_PATH, exist_ok=True)
+
+# --- GPIO Setup ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+
+# --- Sensor status flags ---
+sensor_ready = {
+    'gps': False,
+    'barometer': False,
+    'accelerometer': False,
+}
+
+def check_and_buzz():
+    if all(sensor_ready.values()):
+        print("All sensors initialized. Buzzing!")
+        GPIO.output(BUZZER_PIN, GPIO.HIGH)
 
 def barometer_thread(start_event, stop_event):
     barometer_obj = None
@@ -31,10 +54,12 @@ def barometer_thread(start_event, stop_event):
             if start_event.is_set():
                 if not barometer_obj:
                     barometer_obj, baseline = barometer.initialise_bme280()
+                    sensor_ready['barometer'] = True
+                    check_and_buzz()
                 relative_altitude = barometer.get_relative_altitude(barometer_obj, baseline)
                 writer.writerow([datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f"), relative_altitude])
                 file.flush()
-                time.sleep(BAROMETER_DATA_PERIOD)  # Read sensors and save data according to DATA_PERIOD
+                time.sleep(BAROMETER_DATA_PERIOD)
 
 def accel_thread(start_event, stop_event):
     accel_obj = None
@@ -46,11 +71,13 @@ def accel_thread(start_event, stop_event):
             if start_event.is_set():
                 if not accel_obj:
                     accel_obj = accelerometer.initialise_accelerometer()
+                    sensor_ready['accelerometer'] = True
+                    check_and_buzz()
                 accel_data = accelerometer.get_acceleration(accel_obj)
                 gyro_data = accelerometer.get_gyro(accel_obj)
                 writer.writerow([datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f"), *accel_data, *gyro_data])
                 file.flush()
-                time.sleep(ACCEL_DATA_PERIOD)  # Read sensors and save data according to DATA_PERIOD
+                time.sleep(ACCEL_DATA_PERIOD)
 
 def gps_thread(start_event, stop_event):
     gps_obj = None
@@ -78,9 +105,10 @@ def gps_thread(start_event, stop_event):
 
         while not stop_event.is_set():
             if start_event.is_set():
-
                 if not gps_obj:
                     gps_obj = gps.initialise_gps()
+                    sensor_ready['gps'] = True
+                    check_and_buzz()
 
                 prev_gps_fix = gps_fix
                 position, gps_fix = gps.get_position(gps_obj)
@@ -110,12 +138,19 @@ def gps_thread(start_event, stop_event):
                         position['horizontal_dilution'],
                         position['height_geoid'],
                     ])
-
                     file.flush()
 
-                time.sleep(GPS_DATA_PERIOD)  # Read sensors and save data according to DATA_PERIOD
+                time.sleep(GPS_DATA_PERIOD)
 
 def main():
+
+    # Buzz the buzzer twice to indicate successful startup
+    for i in range(3):
+        GPIO.output(BUZZER_PIN, GPIO.HIGH)
+        time.sleep(0.5)
+        GPIO.output(BUZZER_PIN, GPIO.LOW)    
+        time.sleep(0.5)
+
     # Events to control the threads
     start_event = threading.Event()
     stop_event = threading.Event()
@@ -131,22 +166,34 @@ def main():
     for thread in threads:
         thread.start()
 
-    try:
-        while True:
-            # Simulate starting and stopping the threads
-            command = input("Enter 'start' to start capturing, 'stop' to stop capturing, 'exit' to exit: ").strip().lower()
-            if command == 'start':
-                start_event.set()
-                print("Capture started.")
-            elif command == 'stop':
-                start_event.clear()
-                print("Capture stopped.")
-            elif command == 'exit':
-                stop_event.set()
-                break
-    finally:
+    if len(sys.argv) == 1:
+        print("Running in automatic mode. Press Ctrl+C to stop.")
+
+        start_event.set()
+        print("Capture started.")
         for thread in threads:
             thread.join()
+
+    elif sys.argv[1] == 'manual':
+        print("Running in manual mode. Press Ctrl+C to stop.")
+
+        try:
+            while True:
+                # Simulate starting and stopping the threads
+                command = input("Enter 'start' to start capturing, 'stop' to stop capturing, 'exit' to exit: ").strip().lower()
+                if command == 'start':
+                    start_event.set()
+                    print("Capture started.")
+                elif command == 'stop':
+                    start_event.clear()
+                    print("Capture stopped.")
+                elif command == 'exit':
+                    stop_event.set()
+                    GPIO.cleanup()
+                    break
+        finally:
+            for thread in threads:
+                thread.join()
 
 if __name__ == '__main__':
     main()
